@@ -30,6 +30,7 @@ NUM_TRANSACTIONS = 1000
 BATCH_SIZE = 50
 MEMORY_THRESHOLD_MB = 0.1
 LEAK_REPORT_FILE = "leak_report.txt"
+STATUS_INTERVAL_SECONDS = 300  # 5 Minutes
 
 # ============================================================================
 # DATA GENERATION
@@ -63,11 +64,8 @@ def analyze_profiler_output(output_str):
                 increment = float(parts[3])
                 code = ' '.join(parts[4:])
                 
-                # Filter A: Ignore baseline (Increment ~= Mem Usage)
                 if abs(mem_usage - increment) < 1.0: continue
-                # Filter B: Ignore tiny noise
                 if increment < 0.1: continue
-                # Filter C: Ignore wrapper noise
                 if "site-packages" in line or "memory_profiler.py" in line: continue
                 
                 significant_lines.append({
@@ -109,20 +107,26 @@ def main():
     lp = LineProfiler()
     lp.add_function(ner.execute)
     lp.add_function(ner.preprocess_input)
-    # lp.add_function(ner.extract_results) 
     
-    print("\nProcessing batches...")
+    total_batches = (len(df) + BATCH_SIZE - 1) // BATCH_SIZE
+    print(f"\nProcessing {total_batches} batches...")
     
     profiler = psutil.Process(os.getpid())
     initial_mem = profiler.memory_info().rss / 1024 / 1024
-    
-    # --- NEW: Aggregator for Final Summary ---
-    # Key: (Function Name, Line Number)
-    # Value: {'total_inc': float, 'count': int, 'code': str}
     leak_stats = defaultdict(lambda: {'total_inc': 0.0, 'count': 0, 'code': ''})
+    
+    # --- TIME TRACKING START ---
+    last_status_time = time.time()
     
     for i in range(0, len(df), BATCH_SIZE):
         batch_num = (i // BATCH_SIZE) + 1
+        
+        # --- 5-MINUTE STATUS UPDATE ---
+        current_time = time.time()
+        if current_time - last_status_time >= STATUS_INTERVAL_SECONDS:
+            print(f"[Status] Processing Batch {batch_num}/{total_batches} ({datetime.now().strftime('%H:%M:%S')})")
+            last_status_time = current_time
+        # ------------------------------
         
         batch_df = df.iloc[i:i+BATCH_SIZE]
         desc_vec = np.array(batch_df['description'].tolist(), dtype='|S0').reshape(BATCH_SIZE, 1)
@@ -152,8 +156,6 @@ def main():
             if culprits:
                 for c in culprits:
                     msg += f"     [{c['func']}] Line {c['line']}: +{c['inc']:.2f} MB | {c['code'][:60]}...\n"
-                    
-                    # --- NEW: Aggregate Stats ---
                     key = (c['func'], c['line'])
                     leak_stats[key]['total_inc'] += c['inc']
                     leak_stats[key]['count'] += 1
@@ -171,18 +173,15 @@ def main():
 
     final_mem = profiler.memory_info().rss / 1024 / 1024
     
-    # --- NEW: Generate Final Top Offenders Table ---
     summary_msg = f"\n--- INVESTIGATION COMPLETE ---\n"
     summary_msg += f"Total Permanent Growth: {final_mem - initial_mem:.2f} MB\n\n"
-    
     summary_msg += "🏆 TOP MEMORY OFFENDERS (Cumulative Impact):\n"
     summary_msg += "="*60 + "\n"
     
-    # Sort by Total Increment (Highest first)
     sorted_stats = sorted(leak_stats.items(), key=lambda x: x[1]['total_inc'], reverse=True)
     
     if sorted_stats:
-        for (func, line), data in sorted_stats[:5]: # Show top 5
+        for (func, line), data in sorted_stats[:5]:
             summary_msg += f"Function: {func}() | Line: {line}\n"
             summary_msg += f"  Total Growth: {data['total_inc']:.2f} MB\n"
             summary_msg += f"  Frequency:    {data['count']} batches\n"
@@ -196,4 +195,4 @@ def main():
     print(f"Report saved to {LEAK_REPORT_FILE}")
 
 if __name__ == '__main__':
-    main()
+    main()                    
