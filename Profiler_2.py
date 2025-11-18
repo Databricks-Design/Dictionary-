@@ -8,6 +8,7 @@ import psutil
 import random
 from datetime import datetime
 from io import StringIO
+from collections import defaultdict
 
 current_dir = os.getcwd()
 if current_dir not in sys.path:
@@ -89,7 +90,6 @@ def log_to_file(message):
 def main():
     os.environ['DESCRIPTORS_TO_REMOVE'] = 'LLC,PTY,INC'
     
-    # Initialize Log File
     with open(LEAK_REPORT_FILE, "w") as f:
         f.write(f"MEMORY INVESTIGATION REPORT - {datetime.now()}\n")
         f.write("==================================================\n\n")
@@ -100,21 +100,26 @@ def main():
     descriptions = [generate_unique_transaction(i) for i in range(NUM_TRANSACTIONS)]
     df = pd.DataFrame({'description': descriptions, 'memo': [""] * NUM_TRANSACTIONS})
     
-    # 2. Initialize Model (No @profile in spacy_model.py!)
+    # 2. Initialize Model
     ner = SpacyModel()
     ner.initialize({'model_name': 'us_spacy_ner'})
     ner.add_memory_zone = True
     
-    # 3. Setup Profiler Dynamically
+    # 3. Setup Profiler
     lp = LineProfiler()
     lp.add_function(ner.execute)
     lp.add_function(ner.preprocess_input)
-    # lp.add_function(ner.extract_results) # Optional
+    # lp.add_function(ner.extract_results) 
     
     print("\nProcessing batches...")
     
     profiler = psutil.Process(os.getpid())
     initial_mem = profiler.memory_info().rss / 1024 / 1024
+    
+    # --- NEW: Aggregator for Final Summary ---
+    # Key: (Function Name, Line Number)
+    # Value: {'total_inc': float, 'count': int, 'code': str}
+    leak_stats = defaultdict(lambda: {'total_inc': 0.0, 'count': 0, 'code': ''})
     
     for i in range(0, len(df), BATCH_SIZE):
         batch_num = (i // BATCH_SIZE) + 1
@@ -138,22 +143,25 @@ def main():
         delta = mem_after - mem_before
         
         if delta > MEMORY_THRESHOLD_MB:
-            # Get raw string
             s = StringIO()
             show_results(lp, stream=s)
             culprits = analyze_profiler_output(s.getvalue())
             
-            # Construct Report Message
             msg = f"🔎 LEAK in Batch {batch_num} | Net Growth: +{delta:.2f} MB\n"
             msg += "   Culprits:\n"
             if culprits:
                 for c in culprits:
                     msg += f"     [{c['func']}] Line {c['line']}: +{c['inc']:.2f} MB | {c['code'][:60]}...\n"
+                    
+                    # --- NEW: Aggregate Stats ---
+                    key = (c['func'], c['line'])
+                    leak_stats[key]['total_inc'] += c['inc']
+                    leak_stats[key]['count'] += 1
+                    leak_stats[key]['code'] = c['code'].strip()
             else:
                 msg += "     (Spread across small allocations < 0.1 MB)\n"
             msg += "-" * 60
             
-            # Print to Console AND File
             print(msg)
             log_to_file(msg)
             
@@ -162,9 +170,29 @@ def main():
         gc.collect()
 
     final_mem = profiler.memory_info().rss / 1024 / 1024
-    end_msg = f"\n--- INVESTIGATION COMPLETE ---\nTotal Permanent Growth: {final_mem - initial_mem:.2f} MB"
-    print(end_msg)
-    log_to_file(end_msg)
+    
+    # --- NEW: Generate Final Top Offenders Table ---
+    summary_msg = f"\n--- INVESTIGATION COMPLETE ---\n"
+    summary_msg += f"Total Permanent Growth: {final_mem - initial_mem:.2f} MB\n\n"
+    
+    summary_msg += "🏆 TOP MEMORY OFFENDERS (Cumulative Impact):\n"
+    summary_msg += "="*60 + "\n"
+    
+    # Sort by Total Increment (Highest first)
+    sorted_stats = sorted(leak_stats.items(), key=lambda x: x[1]['total_inc'], reverse=True)
+    
+    if sorted_stats:
+        for (func, line), data in sorted_stats[:5]: # Show top 5
+            summary_msg += f"Function: {func}() | Line: {line}\n"
+            summary_msg += f"  Total Growth: {data['total_inc']:.2f} MB\n"
+            summary_msg += f"  Frequency:    {data['count']} batches\n"
+            summary_msg += f"  Code:         {data['code']}\n"
+            summary_msg += "-"*60 + "\n"
+    else:
+        summary_msg += "No specific lines exceeded threshold consistently.\n"
+
+    print(summary_msg)
+    log_to_file(summary_msg)
     print(f"Report saved to {LEAK_REPORT_FILE}")
 
 if __name__ == '__main__':
