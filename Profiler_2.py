@@ -14,64 +14,48 @@ current_dir = os.getcwd()
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# --- IMPORTS & MOCKS ---
+# --- 1. IMPORTS (Matching your reference script) ---
 try:
     from packages.spacy_model import SpacyModel
-    # Mock Objects for local execution
-    try:
-        from triton_python_backend_utils import Tensor
-        from tests.mocks import mockInferenceRequest, Request
-    except ImportError:
-        # Fallback Dummy Classes if mocks aren't found
-        class Tensor:
-            def __init__(self, data, name):
-                self.data = data
-                self.name = name
-            def as_numpy(self):
-                return self.data
-        class Request:
-            def __init__(self, inputs):
-                self.inputs = {t.name: t for t in inputs}
-            def get_input_tensor_by_name(self, name):
-                return self.inputs.get(name)
-                
-    # Memory Profiler Import
+    from triton_python_backend_utils import Tensor
+    from tests.mocks import mockInferenceRequest
+    from unidecode import unidecode
+    
+    # Profiler Import
     from memory_profiler import LineProfiler, show_results
-
 except ImportError as e:
     print(f"Setup Error: {e}")
-    print("Please ensure 'memory-profiler' is installed and 'packages/spacy_model.py' exists.")
     sys.exit(1)
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-NUM_TRANSACTIONS = 50000      # Total records to process
-BATCH_SIZE = 50               # Small batch size for granular leak detection
-MEMORY_THRESHOLD_MB = 0.1     # Report leaks larger than this
-STATUS_INTERVAL_SECONDS = 300 # Print "Processing..." every 5 minutes
+# Data Generation
+NUM_TRANSACTIONS = 50000      # Total rows to generate
+BATCH_SIZE = 50               # Keep small for granular leak detection
 
-# Output Settings
-SAVE_OUTPUTS = True           # Set False to skip CSV writing (Faster)
-BATCHES_PER_FILE = 2000       # New CSV file every 2000 batches (100k records)
+# Output Handling
 OUTPUT_DIR = "./output_investigation"
+BATCHES_PER_FILE = 2000       # Rotate CSV after this many batches
+
+# Leak Detection
+MEMORY_THRESHOLD_MB = 0.1     # Only report leaks larger than this
 LEAK_REPORT_FILE = "leak_report.txt"
+STATUS_INTERVAL_SECONDS = 300 # 5 Minutes
 
 # ============================================================================
-# 1. DATA GENERATION (Realistic)
+# 2. DATA GENERATION
 # ============================================================================
 def generate_unique_transaction(iteration: int, num_unique_tokens: int = 50) -> str:
     """Generates unique transaction to stress Vocab growth."""
-    transaction_types = ["POS", "ATM", "ONLINE", "TRANSFER", "PAYMENT", "REFUND"]
-    merchants = ["AMAZON", "WALMART", "STARBUCKS", "UBER", "APPLE", "GOOGLE"]
+    transaction_types = ["POS", "ATM", "ONLINE", "TRANSFER", "PAYMENT"]
+    merchants = ["AMAZON", "WALMART", "STARBUCKS", "UBER", "APPLE"]
     
     txn_id = f"TXN{iteration:010d}"
-    merchant = f"{random.choice(merchants)}{iteration}" # Unique merchant string
+    merchant = f"{random.choice(merchants)}{iteration}"
     amount = f"${(iteration % 995) + 5.0:.2f}"
     
-    # Add unique noise tokens to force Vocab entries
-    unique_tokens = [f"UNK-{iteration}-{i}" for i in range(10)] 
-    
+    unique_tokens = [f"UNK-{iteration}-{i}" for i in range(10)]
     parts = [txn_id, "POS", merchant, amount] + unique_tokens
     return " ".join(parts)
 
@@ -79,10 +63,11 @@ def generate_dataset(num_rows):
     print(f"Generating {num_rows:,} synthetic transactions...")
     descriptions = [generate_unique_transaction(i) for i in range(num_rows)]
     memos = [""] * num_rows
+    # Return DF exactly as your script expects
     return pd.DataFrame({'description': descriptions, 'memo': memos})
 
 # ============================================================================
-# 2. PROFILER ANALYSIS UTILS
+# 3. PROFILER UTILS
 # ============================================================================
 def analyze_profiler_output(output_str):
     """Parses raw profiler string to find lines with memory growth."""
@@ -90,17 +75,13 @@ def analyze_profiler_output(output_str):
     current_function = "Unknown"
     
     for line in output_str.split('\n'):
-        # Track function context
         if 'def ' in line:
             parts = line.split()
-            try:
-                current_function = parts[parts.index('def') + 1].split('(')[0]
+            try: current_function = parts[parts.index('def') + 1].split('(')[0]
             except: pass
             continue
 
-        # Parse metrics
         parts = line.split()
-        # Line format: Line #, Mem usage, Increment, Code
         if len(parts) >= 4 and parts[0].isdigit() and 'MiB' in line:
             try:
                 line_num = int(parts[0])
@@ -108,12 +89,9 @@ def analyze_profiler_output(output_str):
                 increment = float(parts[3])
                 code = ' '.join(parts[4:])
                 
-                # --- SMART FILTERS ---
-                # 1. Ignore Baseline (First line of function often shows total usage as increment)
+                # Filters to remove noise
                 if abs(mem_usage - increment) < 1.0: continue
-                # 2. Ignore tiny noise
                 if increment < 0.05: continue
-                # 3. Ignore wrapper overhead
                 if "memory_profiler.py" in line: continue
                 
                 significant_lines.append({
@@ -123,7 +101,6 @@ def analyze_profiler_output(output_str):
                     'code': code
                 })
             except ValueError: continue
-
     return significant_lines
 
 def log_to_file(message):
@@ -131,7 +108,7 @@ def log_to_file(message):
         f.write(message + "\n")
 
 # ============================================================================
-# 3. MAIN INVESTIGATION LOOP
+# 4. MAIN EXECUTION
 # ============================================================================
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -142,180 +119,162 @@ def main():
         f.write(f"MEMORY INVESTIGATION REPORT - {datetime.now()}\n")
         f.write("==================================================\n\n")
 
-    print(f"--- Starting Investigation ---")
-    print(f"Transactions: {NUM_TRANSACTIONS:,} | Batch Size: {BATCH_SIZE}")
-    print(f"Saving Outputs: {SAVE_OUTPUTS}")
+    print(f"--- Starting Investigation (Transactions: {NUM_TRANSACTIONS:,}) ---")
     
-    # --- A. GENERATE DATA ---
+    # A. GENERATE DATA
     df = generate_dataset(NUM_TRANSACTIONS)
     
-    # --- B. INIT MODEL ---
+    # B. INIT MODEL
     print("Initializing SpaCy model...")
-    ner = SpacyModel()
-    ner.initialize({'model_name': 'us_spacy_ner', 'model_version': '1'})
-    ner.add_memory_zone = True
+    ner_model = SpacyModel()
+    ner_model.initialize({'model_name': 'us_spacy_ner'})
+    ner_model.add_memory_zone = True # Set the flag we want to test
     
-    # --- C. SETUP PROFILER ---
-    # Dynamically attach to spacy_model functions. 
-    # DO NOT use @profile in spacy_model.py
+    # C. SETUP PROFILER
     lp = LineProfiler()
-    lp.add_function(ner.execute)
-    lp.add_function(ner.preprocess_input)
-    lp.add_function(ner.extract_results)
-    # Add any other specific internal functions if needed
+    lp.add_function(ner_model.execute)
+    lp.add_function(ner_model.preprocess_input)
+    lp.add_function(ner_model.extract_results)
     
-    # --- D. TRACKING VARIABLES ---
+    # D. TRACKING VARIABLES
     profiler = psutil.Process(os.getpid())
     initial_mem = profiler.memory_info().rss / 1024 / 1024
-    
-    # Stats: Key=(Function, Line), Value={total_inc, count, code}
     leak_stats = defaultdict(lambda: {'total_inc': 0.0, 'count': 0, 'code': ''})
     
-    total_batches = (len(df) + BATCH_SIZE - 1) // BATCH_SIZE
-    last_status_time = time.time()
-    
-    # Output CSV tracking
-    current_file_index = 1
+    # File Rotation Tracking (From your reference script)
+    file_counter = 1
     batches_in_current_file = 0
-    current_csv_path = os.path.join(OUTPUT_DIR, f"output_part_{current_file_index:03d}.csv")
-    is_new_file = True
-
-    print(f"\nProcessing {total_batches} batches...")
+    first_batch_in_file = True
+    current_csv_path = os.path.join(OUTPUT_DIR, f'output_part_{file_counter:03d}.csv')
     
+    num_batches = (len(df) + BATCH_SIZE - 1) // BATCH_SIZE
+    last_status_time = time.time()
+
+    print(f"\nProcessing {num_batches} batches...")
+    print(f"Outputs will be saved to {OUTPUT_DIR}")
+    print(f"Logs in {LEAK_REPORT_FILE}\n")
+
     for i in range(0, len(df), BATCH_SIZE):
         batch_num = (i // BATCH_SIZE) + 1
         
         # 1. STATUS UPDATE (Every 5 Mins)
         if time.time() - last_status_time >= STATUS_INTERVAL_SECONDS:
-            print(f"[Status] Batch {batch_num}/{total_batches} | Time: {datetime.now().strftime('%H:%M:%S')}")
+            print(f"[Status] Batch {batch_num}/{num_batches} ({datetime.now().strftime('%H:%M:%S')})")
             last_status_time = time.time()
 
-        # 2. PREPARE INPUTS
+        # 2. PREPARE INPUTS (Reference Logic)
         batch_df = df.iloc[i:i+BATCH_SIZE].copy()
-        desc_vec = np.array(batch_df['description'].tolist(), dtype='|S0').reshape(len(batch_df), 1)
-        memo_vec = np.array(batch_df['memo'].tolist(), dtype='|S0').reshape(len(batch_df), 1)
+        descriptions = batch_df['description'].to_list()
+        memo = batch_df['memo'].to_list()
         
-        # Create Request (Mock or Real)
-        if 'Request' in globals():
-            req = [Request(inputs=[Tensor(desc_vec, 'description'), Tensor(memo_vec, 'memo')])]
-        else:
-            req = [mockInferenceRequest(inputs=[Tensor(desc_vec, 'description'), Tensor(memo_vec, 'memo')])]
+        descriptions_vec = np.array(descriptions, dtype='|S0').reshape(len(descriptions), 1)
+        memos_vec = np.array(memo, dtype='|S0').reshape(len(memo), 1)
         
-        # 3. EXECUTION & PROFILING
+        requests = [
+            mockInferenceRequest(inputs=[
+                Tensor(data=descriptions_vec, name='description'),
+                Tensor(data=memos_vec, name='memo')
+            ])
+        ]
+        
+        # 3. EXECUTE & PROFILE
         mem_before = profiler.memory_info().rss / 1024 / 1024
         
-        # Only profile the model execution to save time/noise
         lp.enable()
-        raw_results = ner.execute(req, ner.add_memory_zone)
+        raw_results = ner_model.execute(requests, ner_model.add_memory_zone)
         lp.disable()
         
         mem_after = profiler.memory_info().rss / 1024 / 1024
         delta = mem_after - mem_before
         
-        # 4. LEAK DETECTION
+        # 4. DETECT LEAK
         if delta > MEMORY_THRESHOLD_MB:
-            # Analyze
             s = StringIO()
             show_results(lp, stream=s)
             culprits = analyze_profiler_output(s.getvalue())
             
-            # Report
             msg = f"🔎 LEAK in Batch {batch_num} | Net Growth: +{delta:.2f} MB\n"
             msg += "   Culprits:\n"
-            
             found_culprit = False
             if culprits:
                 for c in culprits:
                     msg += f"     [{c['func']}] Line {c['line']}: +{c['inc']:.2f} MB | {c['code'][:60]}...\n"
-                    
-                    # Update Stats
                     k = (c['func'], c['line'])
                     leak_stats[k]['total_inc'] += c['inc']
                     leak_stats[k]['count'] += 1
                     leak_stats[k]['code'] = c['code'].strip()
                     found_culprit = True
             
-            if not found_culprit:
-                msg += "     (Growth spread across small allocations < 0.05 MB)\n"
+            if not found_culprit: msg += "     (Growth spread across small allocations)\n"
             msg += "-" * 60
             
             print(msg)
             log_to_file(msg)
-            
-        # 5. OUTPUT SAVING (Optional)
-        if SAVE_OUTPUTS:
-            # Parse results similar to your run_test logic
-            outputs = []
-            for rr in raw_results:
-                # Assuming output_tensors structure from mock/real response
-                # Logic tailored to standard mock structure
-                t_map = {t.name(): t.as_numpy() for t in rr.output_tensors()} if hasattr(rr, 'output_tensors') else {t.name: t.as_numpy() for t in rr.output_tensors}
-                
-                labels = t_map.get('label', []).tolist()
-                texts = t_map.get('extractedText', []).tolist()
-                ids = t_map.get('entityId', []).tolist()
-                
-                # Flatten batch results
-                for l_list, t_list, id_list in zip(labels, texts, ids):
-                    row_res = []
-                    # Decode bytes if necessary
-                    l_dec = [x.decode('utf-8') if isinstance(x, bytes) else x for x in l_list]
-                    t_dec = [x.decode('utf-8') if isinstance(x, bytes) else x for x in t_list]
-                    id_dec = [x.decode('utf-8') if isinstance(x, bytes) else x for x in id_list]
-                    
-                    for lbl, txt, eid in zip(l_dec, t_dec, id_dec):
-                        if lbl: row_res.append(f"{lbl}:{txt}")
-                    outputs.append("; ".join(row_res))
 
-            batch_df['ner_output'] = outputs
+        # 5. PROCESS OUTPUTS (Reference Logic)
+        outputs = []
+        for raw_result in raw_results:
+            # Use function call () as in your reference
+            labels, extracted_texts, entity_ids = raw_result.output_tensors()
             
-            # Write to CSV
-            mode = 'w' if is_new_file else 'a'
-            header = is_new_file
-            batch_df.to_csv(current_csv_path, index=False, mode=mode, header=header)
-            is_new_file = False
-            batches_in_current_file += 1
+            labels = labels.as_numpy().tolist()
+            extracted_texts = extracted_texts.as_numpy().tolist()
+            entity_ids = entity_ids.as_numpy().tolist()
             
-            # Rotate file check
-            if batches_in_current_file >= BATCHES_PER_FILE:
-                current_file_index += 1
-                current_csv_path = os.path.join(OUTPUT_DIR, f"output_part_{current_file_index:03d}.csv")
-                batches_in_current_file = 0
-                is_new_file = True
+            for label_list, extracted_entity_list, entity_id_list in zip(labels, extracted_texts, entity_ids):
+                these_outputs = []
+                decoded_labels = [x.decode('utf-8') for x in label_list]
+                decoded_extracted_texts = [x for x in extracted_entity_list]
+                decoded_entity_ids = [x.decode('utf-8') for x in entity_id_list]
+                
+                for label, extracted_text, entity_id in zip(decoded_labels, decoded_extracted_texts, decoded_entity_ids):
+                    if label != '' and label is not None:
+                        these_outputs.append({
+                            'entity_type': label,
+                            'extracted_entity': extracted_text,
+                            'standardized_entity': entity_id
+                        })
+                outputs.append(these_outputs)
+        
+        batch_df['outputs_ner'] = outputs
 
-        # 6. CLEANUP
-        lp.code_map.clear() # IMPORTANT: Reset profiler stats for next batch
-        del batch_df, desc_vec, memo_vec, req, raw_results
+        # 6. SAVE CSV (Reference File Rotation Logic)
+        if first_batch_in_file:
+            batch_df.to_csv(current_csv_path, index=False, mode='w')
+            first_batch_in_file = False
+        else:
+            batch_df.to_csv(current_csv_path, index=False, mode='a', header=False)
+        
+        batches_in_current_file += 1
+        
+        if batches_in_current_file >= BATCHES_PER_FILE:
+            # Rotate file
+            file_counter += 1
+            batches_in_current_file = 0
+            first_batch_in_file = True
+            current_csv_path = os.path.join(OUTPUT_DIR, f'output_part_{file_counter:03d}.csv')
+
+        # 7. CLEANUP
+        lp.code_map.clear()
+        del batch_df, descriptions, memo, requests, raw_results, outputs
         gc.collect()
 
     # ============================================================================
-    # 4. FINAL SUMMARY
+    # 5. FINAL SUMMARY
     # ============================================================================
     final_mem = profiler.memory_info().rss / 1024 / 1024
     
     summary = f"\n--- INVESTIGATION COMPLETE ---\n"
     summary += f"Total Permanent Growth: {final_mem - initial_mem:.2f} MB\n\n"
-    summary += "🏆 TOP MEMORY OFFENDERS (Lines causing permanent growth):\n"
-    summary += "="*60 + "\n"
+    summary += "🏆 TOP MEMORY OFFENDERS:\n" + "="*60 + "\n"
     
-    # Sort by Total Growth
     sorted_stats = sorted(leak_stats.items(), key=lambda x: x[1]['total_inc'], reverse=True)
-    
-    if sorted_stats:
-        for (func, line), data in sorted_stats[:10]: # Top 10
-            summary += f"Function: {func}() | Line: {line}\n"
-            summary += f"  Total Impact: {data['total_inc']:.2f} MB\n"
-            summary += f"  Frequency:    {data['count']} batches\n"
-            summary += f"  Code:         {data['code']}\n"
-            summary += "-"*60 + "\n"
-    else:
-        summary += "No specific lines consistently exceeded threshold.\n"
+    for (func, line), data in sorted_stats[:10]:
+        summary += f"Function: {func}() | Line: {line}\n  Impact: {data['total_inc']:.2f} MB | Count: {data['count']}\n  Code: {data['code']}\n" + "-"*60 + "\n"
 
     print(summary)
     log_to_file(summary)
     print(f"Report saved to {LEAK_REPORT_FILE}")
-    if SAVE_OUTPUTS:
-        print(f"Outputs saved to {OUTPUT_DIR}")
 
 if __name__ == '__main__':
     main()
