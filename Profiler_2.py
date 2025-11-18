@@ -13,21 +13,13 @@ current_dir = os.getcwd()
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# --- Ensure these are in your Python path ---
 try:
     from packages.spacy_model import SpacyModel
     from triton_python_backend_utils import Tensor
     from tests.mocks import mockInferenceRequest
-except ImportError as e:
-    print(f"Error: Could not import necessary modules. Make sure 'packages' and 'tests' are in your sys.path.")
-    print(e)
-    sys.exit(1)
-
-# --- Import the memory profiler API ---
-try:
     from memory_profiler import LineProfiler, show_results
-except ImportError:
-    print("Error: 'memory-profiler' not found. Please run: pip install memory-profiler")
+except ImportError as e:
+    print(f"Setup Error: {e}")
     sys.exit(1)
 
 # ============================================================================
@@ -35,311 +27,145 @@ except ImportError:
 # ============================================================================
 NUM_TRANSACTIONS = 1000
 BATCH_SIZE = 50
-MEMORY_THRESHOLD_MB = 0.5  # Min batch-over-batch growth to trigger a report
-LINE_THRESHOLD_MB = 0.3    # Min line-by-line growth to highlight in report
+MEMORY_THRESHOLD_MB = 0.1
 LEAK_REPORT_FILE = "leak_report.txt"
-PROFILER_OUTPUT_FILE = "profiler_output.txt"
 
 # ============================================================================
-# SYNTHETIC DATA
+# DATA GENERATION
 # ============================================================================
-
 def generate_unique_transaction(iteration: int, num_unique_tokens: int = 50) -> str:
-    """Generates a transaction string with many unique tokens."""
-    transaction_types = ["POS", "ATM", "ONLINE", "TRANSFER", "PAYMENT", "REFUND", "WITHDRAWAL", "DEPOSIT"]
-    merchants = ["AMAZON", "WALMART", "STARBUCKS", "SHELL", "MCDONALDS", "TARGET", "COSTCO", "BESTBUY", 
-                 "NETFLIX", "UBER", "AIRBNB", "BOOKING", "PAYPAL", "VENMO", "SQUARE", "SPOTIFY", 
-                 "APPLE", "GOOGLE", "MICROSOFT", "CHIPOTLE"]
-    
     txn_id = f"TXN{iteration:010d}"
-    merchant = f"{random.choice(merchants)}{random.randint(1000, 9999)}"
-    amount = f"${random.uniform(5.0, 999.99):.2f}"
-    card = f"CARD-{random.randint(1000, 9999)}"
-    acct = f"ACCT{random.randint(1000000, 9999999)}"
-    auth = f"AUTH{random.randint(100000, 999999)}"
-    ref = f"REF{iteration}{random.randint(1000, 9999)}"
-    merchant_id = f"MID{random.randint(100000, 999999)}"
-    terminal = f"T{random.randint(1000, 9999)}"
-    batch = f"B{random.randint(100, 999)}"
-    trans_type = random.choice(transaction_types)
-    
-    unique_tokens = []
-    remaining = num_unique_tokens - 11
-    for i in range(remaining):
-        token = f"{random.choice(['LOC', 'ID', 'CODE', 'SEQ'])}{iteration}{i}{random.randint(100, 999)}"
-        unique_tokens.append(token)
-    
-    description_parts = [txn_id, trans_type, merchant, amount, card, acct, auth, ref, merchant_id, terminal, batch] + unique_tokens
-    return " ".join(description_parts)
+    unique_tokens = [f"UNK-{iteration}-{i}" for i in range(num_unique_tokens)]
+    return f"{txn_id} {' '.join(unique_tokens)}"
 
 # ============================================================================
-# PROFILER ANALYSIS
+# SMART ANALYZER
 # ============================================================================
-
-def parse_profiler_line(line):
-    """Parse a memory_profiler output line"""
-    try:
-        parts = line.strip().split()
-        if len(parts) >= 4 and parts[0].isdigit():
-            line_num = int(parts[0])
-            mem_usage = float(parts[1])
-            if parts[3] != 'MiB':
-                increment = float(parts[3])
-            else:
-                increment = 0.0
-            code = ' '.join(parts[4:]) if len(parts) > 4 else ''
-            return line_num, mem_usage, increment, code
-    except:
-        pass
-    return None
-
 def analyze_profiler_output(output_str):
-    """Find lines with significant memory increments"""
-    leaking_lines = []
-    current_function = None
+    significant_lines = []
+    current_function = "Unknown"
     
-    for line in output_str.split('\n'):
-        if 'def ' in line: # Simpler check for function name
+    lines = output_str.split('\n')
+    for line in lines:
+        if 'def ' in line:
+            parts = line.split()
             try:
-                parts = line.strip().split()
-                idx = parts.index('def')
-                if idx + 1 < len(parts):
-                    func_name = parts[idx + 1].split('(')[0]
-                    current_function = func_name
-            except:
-                pass
-        
-        parsed = parse_profiler_line(line)
-        if parsed:
-            line_num, mem_usage, increment, code = parsed
-            if increment > LINE_THRESHOLD_MB:
-                leaking_lines.append({
-                    'function': current_function,
+                current_function = parts[parts.index('def') + 1].split('(')[0]
+            except: pass
+            continue
+
+        parts = line.split()
+        if len(parts) >= 4 and parts[0].isdigit() and 'MiB' in line:
+            try:
+                line_num = int(parts[0])
+                mem_usage = float(parts[1])
+                increment = float(parts[3])
+                code = ' '.join(parts[4:])
+                
+                # Filter A: Ignore baseline (Increment ~= Mem Usage)
+                if abs(mem_usage - increment) < 1.0: continue
+                # Filter B: Ignore tiny noise
+                if increment < 0.1: continue
+                # Filter C: Ignore wrapper noise
+                if "site-packages" in line or "memory_profiler.py" in line: continue
+                
+                significant_lines.append({
+                    'func': current_function,
                     'line': line_num,
-                    'increment': increment,
-                    'mem_usage': mem_usage,
-                    'code': code.strip()
+                    'inc': increment,
+                    'code': code
                 })
+            except ValueError: continue
+
+    return significant_lines
+
+def log_to_file(message):
+    with open(LEAK_REPORT_FILE, "a") as f:
+        f.write(message + "\n")
+
+# ============================================================================
+# MAIN RUNNER
+# ============================================================================
+def main():
+    os.environ['DESCRIPTORS_TO_REMOVE'] = 'LLC,PTY,INC'
     
-    return leaking_lines
+    # Initialize Log File
+    with open(LEAK_REPORT_FILE, "w") as f:
+        f.write(f"MEMORY INVESTIGATION REPORT - {datetime.now()}\n")
+        f.write("==================================================\n\n")
 
-# ============================================================================
-# LEAK TRACKING
-# ============================================================================
-
-class LeakTracker:
-    """Handles writing the summary and raw profiler output to files."""
-    def __init__(self, report_file, profiler_file):
-        self.report_file = report_file
-        self.profiler_file = profiler_file
-        self.leaks = []
-        
-        # Initialize leak report
-        with open(self.report_file, 'w') as f:
-            f.write("="*80 + "\n")
-            f.write("MEMORY LEAK DETECTION REPORT\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("="*80 + "\n\n")
-        
-        # Initialize profiler output
-        with open(self.profiler_file, 'w') as f:
-            f.write("="*90 + "\n")
-            f.write("MEMORY PROFILER OUTPUT - DETAILED VIEW\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("="*90 + "\n\n")
+    print(f"--- Starting Investigation (Transactions: {NUM_TRANSACTIONS}) ---")
     
-    def record_leak(self, batch_num, mem_delta, leaking_lines, profiler_output):
-        self.leaks.append({
-            'batch': batch_num,
-            'mem_delta': mem_delta,
-            'lines': leaking_lines
-        })
-        
-        # Write to leak report (parsed summary)
-        with open(self.report_file, 'a') as f:
-            f.write(f"\n{'='*80}\n")
-            f.write(f"LEAK #{len(self.leaks)} - Batch {batch_num}\n")
-            f.write(f"{'='*80}\n")
-            f.write(f"Memory increase: {mem_delta:+.2f} MB\n\n")
-            
-            if leaking_lines:
-                f.write(f"Problematic Lines:\n")
-                f.write(f"{'-'*80}\n")
-                for item in leaking_lines:
-                    f.write(f"  Function: {item['function']}()\n")
-                    f.write(f"  Line {item['line']}: {item['code']}\n")
-                    f.write(f"  Memory: {item['mem_usage']:.2f} MB (Δ +{item['increment']:.2f} MB)\n")
-                    f.write(f"{'-'*80}\n")
-            else:
-                f.write("No specific line identified (increment < threshold)\n")
-        
-        # Write to profiler output (raw memory_profiler data)
-        with open(self.profiler_file, 'a') as f:
-            f.write("\n" + "="*90 + "\n")
-            f.write(f"LEAK #{len(self.leaks)} - Batch {batch_num} | Memory Increase: {mem_delta:+.2f} MB\n")
-            f.write("="*90 + "\n")
-            f.write(profiler_output)
-            f.write("\n" + "="*90 + "\n\n")
+    # 1. Setup Data
+    descriptions = [generate_unique_transaction(i) for i in range(NUM_TRANSACTIONS)]
+    df = pd.DataFrame({'description': descriptions, 'memo': [""] * NUM_TRANSACTIONS})
     
-    def finalize(self, initial_mem, final_mem, elapsed_time):
-        # Finalize leak report
-        with open(self.report_file, 'a') as f:
-            f.write("\n" + "="*80 + "\n")
-            f.write("SUMMARY\n")
-            f.write("="*80 + "\n")
-            f.write(f"Total leaks: {len(self.leaks)}\n")
-            f.write(f"Memory growth: {final_mem - initial_mem:.2f} MB\n")
-            f.write(f"Elapsed: {elapsed_time:.2f} seconds\n")
-            f.write("="*80 + "\n")
-        
-        # Finalize profiler output
-        with open(self.profiler_file, 'a') as f:
-            f.write("\n" + "="*90 + "\n")
-            f.write("SESSION SUMMARY\n")
-            f.write("="*90 + "\n")
-            f.write(f"Total leaks captured: {len(self.leaks)}\n")
-            f.write(f"Total memory growth: {final_mem - initial_mem:.2f} MB\n")
-            f.write(f"Elapsed time: {elapsed_time:.2f} seconds\n")
-            f.write("="*90 + "\n")
-
-# ============================================================================
-# PROFILING TEST
-# ============================================================================
-
-def run_test_profiling(ner_model: SpacyModel, df: pd.DataFrame, batch_size: int):
+    # 2. Initialize Model (No @profile in spacy_model.py!)
+    ner = SpacyModel()
+    ner.initialize({'model_name': 'us_spacy_ner'})
+    ner.add_memory_zone = True
+    
+    # 3. Setup Profiler Dynamically
+    lp = LineProfiler()
+    lp.add_function(ner.execute)
+    lp.add_function(ner.preprocess_input)
+    # lp.add_function(ner.extract_results) # Optional
+    
+    print("\nProcessing batches...")
     
     profiler = psutil.Process(os.getpid())
-    initial_memory = profiler.memory_info().rss / 1024 / 1024
+    initial_mem = profiler.memory_info().rss / 1024 / 1024
     
-    print("="*80)
-    print(f"BASELINE: {initial_memory:.2f} MB")
-    print("="*80)
-    print()
-    
-    tracker = LeakTracker(LEAK_REPORT_FILE, PROFILER_OUTPUT_FILE)
-    
-    # Setup LineProfiler
-    # This dynamically adds profiling to your model's functions
-    # without you needing to modify spacy_model.py
-    lp = LineProfiler()
-    lp.add_function(ner_model.execute)
-    lp.add_function(ner_model.preprocess_input)
-    lp.add_function(ner_model.extract_results)
-    # Add any other functions from spacy_model.py you want to watch
-    # lp.add_function(ner_model.clean_ent) 
-    
-    num_batches = (len(df) + batch_size - 1) // batch_size
-    start_time = time.time()
-    
-    print(f"Processing {num_batches} batches... (Will only print if leaks are detected)")
-    
-    for i in range(0, len(df), batch_size):
-        batch_num = (i // batch_size) + 1
+    for i in range(0, len(df), BATCH_SIZE):
+        batch_num = (i // BATCH_SIZE) + 1
         
-        batch_df = df.iloc[i:i+batch_size]
-        descriptions = batch_df['description'].to_list()
-        memo = batch_df['memo'].to_list()
+        batch_df = df.iloc[i:i+BATCH_SIZE]
+        desc_vec = np.array(batch_df['description'].tolist(), dtype='|S0').reshape(BATCH_SIZE, 1)
+        memo_vec = np.array(batch_df['memo'].tolist(), dtype='|S0').reshape(BATCH_SIZE, 1)
         
-        descriptions_vec = np.array(descriptions, dtype='|S0').reshape(len(descriptions), 1)
-        memos_vec = np.array(memo, dtype='|S0').reshape(len(memo), 1)
-        
-        requests = [
-            mockInferenceRequest(inputs=[
-                Tensor(data=descriptions_vec, name='description'),
-                Tensor(data=memos_vec, name='memo')
-            ])
-        ]
+        req = [mockInferenceRequest(inputs=[
+            Tensor(data=desc_vec, name='description'),
+            Tensor(data=memo_vec, name='memo')
+        ])]
         
         mem_before = profiler.memory_info().rss / 1024 / 1024
         
-        # --- ENABLE PROFILER FOR THIS BATCH ---
         lp.enable()
-        # Execute
-        raw_results = ner_model.execute(requests, ner_model.add_memory_zone)
+        ner.execute(req, ner.add_memory_zone)
         lp.disable()
-        # --------------------------------------
         
         mem_after = profiler.memory_info().rss / 1024 / 1024
         delta = mem_after - mem_before
         
-        # Detect leak
         if delta > MEMORY_THRESHOLD_MB:
-            # --- This block only runs if a leak is found ---
+            # Get raw string
+            s = StringIO()
+            show_results(lp, stream=s)
+            culprits = analyze_profiler_output(s.getvalue())
             
-            # 1. Capture profiler output to a string
-            buffer = StringIO()
-            show_results(lp, stream=buffer)
-            profiler_output = buffer.getvalue()
-            
-            # 2. Analyze the string for problematic lines
-            leaking_lines = analyze_profiler_output(profiler_output)
-            
-            # 3. Print the human-readable alert to console
-            print(f"🚨 LEAK - Batch {batch_num}: +{delta:.2f} MB")
-            if leaking_lines:
-                for item in leaking_lines[:3]: # Print top 3 leaks
-                    print(f"    → {item['function']}() line {item['line']}: +{item['increment']:.2f} MB")
+            # Construct Report Message
+            msg = f"🔎 LEAK in Batch {batch_num} | Net Growth: +{delta:.2f} MB\n"
+            msg += "   Culprits:\n"
+            if culprits:
+                for c in culprits:
+                    msg += f"     [{c['func']}] Line {c['line']}: +{c['inc']:.2f} MB | {c['code'][:60]}...\n"
             else:
-                 print(f"    → (No specific line > {LINE_THRESHOLD_MB} MB identified)")
-            print() # Add a newline for readability
+                msg += "     (Spread across small allocations < 0.1 MB)\n"
+            msg += "-" * 60
             
-            # 4. Record to the text file reports
-            tracker.record_leak(batch_num, delta, leaking_lines, profiler_output)
-        
-        # Clear stats for the next batch
+            # Print to Console AND File
+            print(msg)
+            log_to_file(msg)
+            
         lp.code_map.clear()
-
-        # --- "Chatty" status print has been removed ---
-        
-        del batch_df, descriptions, memo, requests, raw_results
+        del req, desc_vec, memo_vec
         gc.collect()
-    
-    elapsed_time = time.time() - start_time
-    final_memory = profiler.memory_info().rss / 1024 / 1024
-    
-    tracker.finalize(initial_memory, final_memory, elapsed_time)
-    
-    # --- FINAL SUMMARY ---
-    print()
-    print("="*80)
-    print(f"FINAL: {final_memory:.2f} MB | Growth: +{final_memory - initial_memory:+.2f} MB")
-    print(f"Total leaks detected: {len(tracker.leaks)} | Time: {elapsed_time:.2f}s")
-    print(f"\nReports saved:")
-    print(f"  - {LEAK_REPORT_FILE} (parsed summary)")
-    print(f"  - {PROFILER_OUTPUT_FILE} (raw profiler output)")
-    print("="*80)
 
-# ============================================================================
-# MAIN
-# ============================================================================
-
-def main():
-    os.environ['DESCRIPTORS_TO_REMOVE'] = 'LLC,PTY,INC'
-    
-    print("="*80)
-    print("MEMORY LEAK DETECTOR")
-    print("="*80)
-    print(f"Transactions: {NUM_TRANSACTIONS:,} | Batch: {BATCH_SIZE}")
-    print(f"Thresholds: Memory={MEMORY_THRESHOLD_MB} MB | Line={LINE_THRESHOLD_MB} MB")
-    print("="*80)
-    print()
-    
-    # Generate data
-    print("Generating data...")
-    descriptions = [generate_unique_transaction(i) for i in range(NUM_TRANSACTIONS)]
-    df = pd.DataFrame({'description': descriptions, 'memo': [""] * NUM_TRANSACTIONS})
-    print(f"Generated {len(df):,} transactions\n")
-    
-    # Initialize model
-    print("Initializing model...")
-    ner = SpacyModel()
-    ner.initialize({'model_name': 'us_spacy_ner'})
-    ner.add_memory_zone = True # Test with memory zone
-    print("Ready!\n")
-    
-    # Run
-    run_test_profiling(ner, df, BATCH_SIZE)
-
+    final_mem = profiler.memory_info().rss / 1024 / 1024
+    end_msg = f"\n--- INVESTIGATION COMPLETE ---\nTotal Permanent Growth: {final_mem - initial_mem:.2f} MB"
+    print(end_msg)
+    log_to_file(end_msg)
+    print(f"Report saved to {LEAK_REPORT_FILE}")
 
 if __name__ == '__main__':
     main()
